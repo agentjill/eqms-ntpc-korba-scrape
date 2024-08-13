@@ -1,10 +1,12 @@
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
-import logging
+from logging.handlers import RotatingFileHandler
 import keyboard
+import logging
 from pathlib import Path
-import threading
 import time
+import threading
 import toml
 from typing import List, Optional, Self, Union
 from selenium import webdriver
@@ -13,6 +15,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+
 
 # Set up logging
 logging.basicConfig(level=logging.INFO,
@@ -66,6 +69,7 @@ class SiteData():
     menu_content: str
     dashboard: str
     master_tab_selector: str
+    caaqms_cems_title_selector: str
     caaqms_cems_master_selector: str
     eqms_master_selector: str
 
@@ -111,7 +115,6 @@ class ConfigData():
             raise
 
 
-@dataclass
 class Param:
 
     def __init__(self, unit: str):
@@ -141,9 +144,12 @@ class Param:
 
 
 class Caaqms:
-    def __init__(self, name, selector: str):
+    def __init__(self, name, config: ConfigData, selector_idx: int):
         self.name: str = name
-        self.selector: str = selector
+        self.selector: str = config.site_data.caaqms_cems_master_selector.replace(
+            "$item", str(selector_idx))
+        self.selector_idx = selector_idx
+        self.unit = None
         self.params = {
             'co': Param("mg/m³"),
             'co2': Param("ppm"),
@@ -159,11 +165,21 @@ class Caaqms:
     def fetch_data(self, driver: WebDriver, file_name, config: ConfigData):
         try:
             WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, config.site_data.master_tab_selector.replace("[]", "1")))).click()
+                (By.CSS_SELECTOR, config.site_data.master_tab_selector.replace("$tab", "1")))).click()
+
+            if self.unit is None:
+                pre = WebDriverWait(driver, 10).until(EC.visibility_of_element_located(
+                    (By.CSS_SELECTOR, config.site_data.caaqms_cems_title_selector.replace("$item", str(self.selector_idx))))).text
+                x = str(
+                    pre.split('_')[-1]).upper().lstrip() if pre.split('_')[-1].upper().isprintable() else None
+                if x is not None:
+                    self.unit = x
+                    self.name = self.name + self.unit
+                    file_name = self.name + ".txt"
 
             for i, (param_name, param) in enumerate(self.params.items(), 1):
                 value = WebDriverWait(driver, 10).until(EC.visibility_of_element_located(
-                    (By.CSS_SELECTOR, self.selector.replace("{}", str(i))))).text
+                    (By.CSS_SELECTOR, self.selector.replace("$param", str(i))))).text
                 param.set_float_check_value(value)
 
             print_with_log(f"{self}", config.output.log_out, True, 'info')
@@ -177,9 +193,12 @@ class Caaqms:
 
 
 class Cems:
-    def __init__(self, name, selector):
+    def __init__(self, name, config: ConfigData, selector_idx: int):
         self.name: str = name
-        self.selector: str = selector
+        self.selector: str = config.site_data.caaqms_cems_master_selector.replace(
+            "$item", str(selector_idx))
+        self.selector_idx = selector_idx
+        self.unit = None
         self.params = {
             'nox': Param("mg/nm³"),
             'pm': Param("mg/nm³"),
@@ -192,11 +211,21 @@ class Cems:
     def fetch_data(self, driver: WebDriver, file_name: str, config: ConfigData):
         try:
             WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, config.site_data.master_tab_selector.replace("[]", "2")))).click()
+                (By.CSS_SELECTOR, config.site_data.master_tab_selector.replace("$tab", "2")))).click()
+
+            if self.unit is None:
+                pre = WebDriverWait(driver, 10).until(EC.visibility_of_element_located(
+                    (By.CSS_SELECTOR, config.site_data.caaqms_cems_title_selector.replace("$item", str(self.selector_idx))))).text
+                x = int(
+                    pre.split('_')[-1]) if pre.split('_')[-1].isdigit() else None
+                if x is not None:
+                    self.unit = x
+                    self.name = self.name + str(x)
+                    file_name = self.name + ".txt"
 
             for i, (param_name, param) in enumerate(self.params.items(), 1):
                 value = WebDriverWait(driver, 10).until(EC.visibility_of_element_located(
-                    (By.CSS_SELECTOR, self.selector.replace("{}", str(i))))).text
+                    (By.CSS_SELECTOR, self.selector.replace("$param", str(i))))).text
                 param.set_float_check_value(value)
 
             print_with_log(f"{self}", config.output.log_out, True, 'info')
@@ -227,11 +256,11 @@ class Eqms:
     def fetch_data(self, driver: WebDriver, file_name: str, config: ConfigData):
         try:
             WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
-                (By.CSS_SELECTOR, config.site_data.master_tab_selector.replace("[]", "3")))).click()
+                (By.CSS_SELECTOR, config.site_data.master_tab_selector.replace("$tab", "3")))).click()
 
             for i, (param_name, param) in enumerate(self.params.items(), 1):
                 value = WebDriverWait(driver, 10).until(EC.visibility_of_element_located(
-                    (By.CSS_SELECTOR, self.selector.replace("{}", str(i))))).text
+                    (By.CSS_SELECTOR, self.selector.replace("$param", str(i))))).text
                 param.set_float_check_value(value)
 
             print_with_log(f"{self}", config.output.log_out, True, 'info')
@@ -243,12 +272,18 @@ class Eqms:
                            str(e)}", config.output.log_out, True, 'error')
 
 
+@contextmanager
 def start_browser_and_login(config: ConfigData):
+    driver = None
     chrome_options = webdriver.ChromeOptions()
     chrome_options.add_argument("--headless")  # Run in headless mode
     chrome_options.add_argument("--no-sandbox")
+    chrome_options.add_argument("--incognito")
     chrome_options.add_argument("--disable-gpu")
+    chrome_options.add_argument("--disable-gpu-compositing")
+    chrome_options.add_argument("--disable-image-loading")
     chrome_options.add_argument("--disable-save-password-bubble")
+    chrome_options.add_argument("--mute-audio")
     chrome_options.add_argument("--disable-extensions")
     chrome_options.add_argument("--disable-default-apps")
     chrome_options.add_argument("--no-default-browser-check")
@@ -264,6 +299,7 @@ def start_browser_and_login(config: ConfigData):
     chrome_options.add_argument("--log-level=3")
     chrome_options.add_argument("--disable-translate")
     chrome_options.add_argument("--disable-sync")
+    chrome_options.add_argument("--disable-notifications")
     chrome_options.add_argument("--disable-autofill")
     chrome_options.add_argument("--disable-speech-api")
     chrome_options.add_argument(
@@ -305,13 +341,15 @@ def start_browser_and_login(config: ConfigData):
             (By.CSS_SELECTOR, config.site_data.password_selector))).send_keys(
             config.login_data.password + Keys.RETURN)
 
-        return driver
+        yield driver
     except Exception as e:
         print_with_log(f"Error during login: {
                        str(e)}", config.output.log_out, True, 'error')
-        if not driver:
-            driver.quit()
         raise
+    finally:
+        if driver is not None:
+            driver.close()
+            driver.quit()
 
 
 def main():
@@ -335,73 +373,70 @@ def main():
         logger.error(f"Error during login: {str(e)}")
         exit()
 
-    caaqms_1 = Caaqms("AAQMS CISF COLONY",
-                      config.site_data.caaqms_cems_master_selector.replace("[]", "1"))
-    caaqms_2 = Caaqms("AAQMS MGR STATION",
-                      config.site_data.caaqms_cems_master_selector.replace("[]", "2"))
-    caaqms_3 = Caaqms("AAQMS INDIRA COMPLEX",
-                      config.site_data.caaqms_cems_master_selector.replace("[]", "3"))
+    caaqms_sites: List[Caaqms] = []
+    for i in range(1, 4):
+        caaqms_sites.append(
+            Caaqms(f"AAQMS ", config, i)
+        )
 
     cems_units: List[Cems] = []
     for i in range(1, 8):
         cems_units.append(
-            Cems(f"CEMS UNIT# {
-                 i}", config.site_data.caaqms_cems_master_selector.replace("[]", str(i)))
+            Cems(f"CEMS UNIT# ", config, i)
         )
 
     eqms = Eqms("ETP", config.site_data.eqms_master_selector)
 
-    driver = start_browser_and_login(config)
-    logger.info("Driver initialisation succesful")
+    # driver = start_browser_and_login(config)
+    with start_browser_and_login(config) as driver:
+        logger.info("Driver initialisation succesful")
 
-    WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
-        (By.CSS_SELECTOR, config.site_data.menu_content))).click()
-    WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
-        (By.CSS_SELECTOR, config.site_data.dashboard))).click()
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, config.site_data.menu_content))).click()
+        WebDriverWait(driver, 10).until(EC.element_to_be_clickable(
+            (By.CSS_SELECTOR, config.site_data.dashboard))).click()
 
-    if (not config.output.log_out.exists()) or config.output.log_out.stat().st_size == 0:
-        print_with_log("------------------------------------",
-                       config.output.log_out, False, 'ignore')
-    print_with_log("Application Started.", config.output.log_out, True, 'info')
-    print_with_log("------------------------------------",
-                   config.output.log_out, False, 'ignore')
-
-    while not exit_flag.is_set():
-        start_time = time.time()
-
-        try:
-            for caaqms in [caaqms_1, caaqms_2, caaqms_3]:
-                caaqms.fetch_data(driver, f"{caaqms.name}.txt", config)
-
-            for cems in cems_units:
-                cems.fetch_data(driver, f"{cems.name}.txt", config)
-
-            eqms.fetch_data(driver, "ETP.txt", config)
-
+        if (not config.output.log_out.exists()) or config.output.log_out.stat().st_size == 0:
             print_with_log("------------------------------------",
                            config.output.log_out, False, 'ignore')
+        print_with_log("Application Started.",
+                       config.output.log_out, True, 'info')
+        print_with_log("------------------------------------",
+                       config.output.log_out, False, 'ignore')
 
-        except Exception as e:
-            print_with_log(f"Error occurred: {
-                           str(e)}", config.output.log_out, True, 'error')
+        while not exit_flag.is_set():
+            start_time = time.time()
 
-        # Calculate remaining time to sleep
-        elapsed_time = time.time() - start_time
-        sleep_time = max(0, config.loop_time_sec - elapsed_time)
+            try:
+                for caaqms in caaqms_sites:
+                    caaqms.fetch_data(driver, f"{caaqms.name}.txt", config)
 
-        # Sleep in short intervals, checking the running flag
-        for _ in range(int(sleep_time / 0.5)):
-            time.sleep(0.5)
-            if exit_flag.is_set():
-                break
+                for cems in cems_units:
+                    cems.fetch_data(driver, f"{cems.name}.txt", config)
+
+                eqms.fetch_data(driver, "ETP.txt", config)
+
+                print_with_log("------------------------------------",
+                               config.output.log_out, False, 'ignore')
+
+            except Exception as e:
+                print_with_log(f"Error occurred: {
+                               str(e)}", config.output.log_out, True, 'error')
+
+            # Calculate remaining time to sleep
+            elapsed_time = time.time() - start_time
+            sleep_time = max(0, config.loop_time_sec - elapsed_time)
+
+            # Sleep in short intervals, checking the running flag
+            for _ in range(int(sleep_time / 0.5)):
+                time.sleep(0.5)
+                if exit_flag.is_set():
+                    break
 
     print_with_log("Received Esc, Preparing to exit...",
                    config.output.log_out, True, 'info')
     print_with_log("------------------------------------",
                    config.output.log_out, False, 'ignore')
-
-    driver.close()
-    driver.quit()
 
     print_with_log(f"Application Ended", config.output.log_out, True, 'info')
     print_with_log("------------------------------------",
