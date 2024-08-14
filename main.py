@@ -1,7 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, UTC
-from logging.handlers import RotatingFileHandler
 import keyboard
 import logging
 from pathlib import Path
@@ -24,6 +23,8 @@ logger = logging.getLogger(__name__)
 
 exit_flag = threading.Event()
 
+Max_SIZE = 50*1024
+
 
 def check_for_exit():
     while not exit_flag.is_set():
@@ -34,10 +35,30 @@ def check_for_exit():
 
 
 def get_time() -> str:
-    return (datetime.now(UTC) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    return (datetime.now(UTC) + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
 def append_to_file(file_path: Path, text: str):
+    max_size = Max_SIZE
+    line = "------------------------------------"
+
+    # Check if file exists and its size
+    if file_path.exists() and file_path.stat().st_size > max_size:
+        with open(file_path, 'r+', encoding='utf-8') as file:
+            content = file.read()
+            # Find the indices of the first two '-------------'
+            first_sep = content.find(line)
+            second_sep = content.find(
+                line, first_sep + len(line))
+
+            # If two separators are found, remove content between them
+            if first_sep != -1 and second_sep != -1:
+                content = content[:first_sep] + content[second_sep:]
+                file.seek(0)
+                file.write(content)
+                file.truncate()
+
+    # Append the new text at the end of the file
     with open(file_path, 'a', encoding='utf-8') as file:
         file.write(f"{text}\n")
 
@@ -55,13 +76,13 @@ def print_with_log(item, file_path: Path, time_req: bool, level):
     append_to_file(file_path=file_path, text=item)
 
 
-@dataclass
+@dataclass(slots=True)
 class LoginData():
     email: str
     password: str
 
 
-@dataclass
+@dataclass(slots=True)
 class SiteData():
     url: str
     login_form: str
@@ -74,18 +95,19 @@ class SiteData():
     eqms_master_selector: str
 
 
-@dataclass
+@dataclass(slots=True)
 class OutData():
     data_out: Path
     log_out: Path
 
 
-@dataclass
+@dataclass(slots=True)
 class ConfigData():
     login_data: LoginData
     site_data: SiteData
     output: OutData
     loop_time_sec: float
+    log_size_kb: int
 
     @classmethod
     def read(cls, file_path='config.toml') -> Union[Self, Exception]:
@@ -102,12 +124,15 @@ class ConfigData():
             site_data = SiteData(**config["site"])
             loop_time_sec = max(
                 float(config["application"]["loop_time_sec"]), 30)
+            log_size_kb = max(
+                int(config["application"]["log_size_kb"]), 50)*1024
 
             return ConfigData(
                 login_data=login_data,
                 site_data=site_data,
                 output=out_data,
-                loop_time_sec=loop_time_sec
+                loop_time_sec=loop_time_sec,
+                log_size_kb=log_size_kb
             )
 
         except Exception as e:
@@ -116,6 +141,8 @@ class ConfigData():
 
 
 class Param:
+    __slots__ = ['value_raw', 'value_parsed',
+                 'unit', 'is_health_ok', 'update_time']
 
     def __init__(self, unit: str):
         self.value_raw: Optional[str] = None
@@ -282,6 +309,8 @@ def start_browser_and_login(config: ConfigData):
     chrome_options.add_argument("--disable-gpu")
     chrome_options.add_argument("--disable-gpu-compositing")
     chrome_options.add_argument("--disable-image-loading")
+    chrome_options.add_argument("--disable-bundled-plugins")
+    chrome_options.add_argument("--disable-flash")
     chrome_options.add_argument("--disable-save-password-bubble")
     chrome_options.add_argument("--mute-audio")
     chrome_options.add_argument("--disable-extensions")
@@ -363,6 +392,8 @@ def main():
         config = ConfigData.read()
         logger.info("successfully read config file")
 
+        global Max_SIZE
+        Max_SIZE = config.log_size_kb
         config.output.data_out.mkdir(parents=True, exist_ok=True)
 
         config.output.log_out.mkdir(parents=True, exist_ok=True)
